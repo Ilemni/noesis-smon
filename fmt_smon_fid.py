@@ -78,72 +78,45 @@ def fid_load_model(data, models):
     mesh_count = bs.readInt()
     print("[FID:Meshes] Count: {0} | File Position: {1}".format(mesh_count, hex(bs.tell())))
 
-    model = NoeModel()
-    model.setModelMaterials(NoeModelMaterials([], []))
-
     for x in range(mesh_count):
         # print("[FID:Mesh {0}] File Position: {1}".format(x, hex(bs.tell())))
         mesh_name = bs.readBytes(0x40).decode().rstrip('\x00')
-        bs.seek(0x40, NOESEEK_REL)
-        mesh_name_2 = bs.readBytes(0x40).decode().rstrip('\x00')
-        bs.seek(0x40, NOESEEK_REL)
+        bs.seek(0xC0, NOESEEK_REL)
         texture_index = bs.readInt()
         bs.seek(0xC, NOESEEK_REL)
 
-        vert_count = bs.readInt()
-        vert_array_size = bs.readInt()  # This should always be vert_count * 12
-        vert_positions = []
-        for _ in range(vert_count):
-            vert_positions.append(NoeVec3((bs.readFloat(), bs.readFloat(), bs.readFloat())))
+        fid_data = FidData(mesh_name)
 
-        uv_size = bs.readInt()
-        uv_data = []
-        for _ in range(int(uv_size / 8)):
-            uv_data.append(NoeVec3((bs.readFloat(), bs.readFloat() * -1, 0)))
+        fid_data.vertex_count = bs.readInt()
+        fid_data.vertex_bytes = read_buffer(bs)
+        fid_data.uv1_bytes = read_buffer(bs)
 
-        uv2_slot = bs.readInt()
-        uv2_data = []
-        uv2_size = 0
-        if uv2_slot != 0:
-            uv2_size = bs.readInt()
-            for _ in range(int(uv2_size / 8)):
-                uv2_data.append(NoeVec3((bs.readFloat(), bs.readFloat() * -1, 0)))
-
-        # ============================= Create mesh ================================== #
-
-        # File does not include triangle data. Rapi expects it, so we have to fake it.
-        mesh = NoeMesh(list(range(vert_count)), vert_positions)
-        model.meshes.append(mesh)
-        mesh.setName(mesh_name)
-        mesh.setUVs(uv_data)
-        if uv2_slot != 0:
-            mesh.setUVs(uv2_data, uv2_slot)
+        fid_data.uv2_slot = bs.readInt()
+        if fid_data.uv2_slot != 0:
+            fid_data.uv2_bytes = read_buffer(bs)
 
         # =============================== Logging ==================================== #
 
         # print("[FID:Mesh {0}] Name: {1} | Texture: {2} | Verts: {3} | UV1: {4} | Has UV2: {5}"
         #       .format(x, mesh_name, texture_paths[texture_index], vert_count, uv_size, uv2_slot) +
         #       ("" if not uv2_slot else " | UV2: {0}".format(uv2_size)))
-        # if mesh_name_2 != mesh_name:
-        #     print("[FID:Mesh {0}] Name: {1} (second stored name is different)".format(x, mesh_name_2))
 
         # ============================= Get Textures ================================= #
 
-        tex_path = texture_paths[texture_index]
-        tex_filepath = noesis.getSelectedDirectory() + "\\" + tex_path
-        if isfile(tex_filepath):
-            texture = rapi.loadExternalTex(tex_filepath)
-            texture.name = tex_path
-            material_name = "Material_" + tex_path
-            material = NoeMaterial(material_name, texture.name)
-
-            model.modelMats.matList.append(material)
-            model.modelMats.texList.append(texture)
-            mesh.setMaterial(material_name)
+        texture_filename = texture_paths[texture_index]
+        texture_filepath = noesis.getSelectedDirectory() + "\\" + texture_filename
+        if not isfile(texture_filepath):
+            noesis.logError("[ERROR] [FID:Mesh {0}] Missing texture {1}\n".format(x, texture_filepath))
         else:
-            noesis.logError("[ERROR] [FID:Mesh {0}] Missing texture {1}\n".format(x, tex_filepath))
+            fid_data.texture = rapi.loadExternalTex(texture_filepath)
+            fid_data.texture.name = texture_filename
+            fid_data.material = NoeMaterial("Material_" + texture_filename, fid_data.texture.name)
 
-    models.append(model)
+        # ============================= Create model ================================= #
+
+        model = fid_data.construct_model()
+        models.append(model)
+
     return 1
 
 
@@ -166,3 +139,71 @@ def bytes_str(bit_array, split=1):
         if idx % split == split - 1:
             out_string += " "
     return out_string
+
+
+class FidData:
+    """
+    Contains data stored in a Summoners War PMM chunk.
+    :cvar vertex_count: Number of vertices in the model. Stored in file as int.
+    :cvar vertex_bytes: Vertex position data. Stored in file as 3x float per item.
+    :cvar uv_bytes: UV position data. Stored in file as 2x float per item.
+    :cvar uv2_bytes: UV position data. Stored in file as 2x float per item.
+    :cvar material: NoeMaterial
+    :cvar texture: NoeTexture
+    """
+
+    model_name = None
+    vertex_count = 0
+    vertex_bytes = []
+    uv1_bytes = []
+    uv2_slot = 0
+    uv2_bytes = None
+    material = None
+    texture = None
+
+    def __init__(self, model_name):
+        self.model_name = model_name
+
+    def construct_model(self):
+        """
+        Constructs the model from member properties.
+        :rtype: NoeModel
+        """
+        rapi.rpgCreateContext()
+        rapi.rpgBindPositionBuffer(self.vertex_bytes, noesis.RPGEODATA_FLOAT, 12)
+        rapi.rpgBindUV1Buffer(self.uv1_bytes, noesis.RPGEODATA_FLOAT, 8)
+        if self.uv2_bytes is not None:
+            rapi.rpgBindUVXBuffer(self.uv2_bytes, noesis.RPGEODATA_FLOAT, 8, self.uv2_slot, 1)
+
+        if self.material.name is not None:
+            rapi.rpgSetMaterial(self.material.name)
+
+        # Rapi requires tris. Fid contains no tris. We have to fake it.
+        # Byte array where every 4 bytes represents an int of ascending value
+        fake_tris = bytearray()
+        for x in range(self.vertex_count):
+            fake_tris.append(x % 256)
+            fake_tris.append((x >> 8) % 256)
+            fake_tris.append((x >> 16) % 256)
+            fake_tris.append((x >> 24) % 256)
+
+        rapi.rpgCommitTriangles(fake_tris, noesis.RPGEODATA_UINT, self.vertex_count, noesis.RPGEO_TRIANGLE, 1)
+
+        model = rapi.rpgConstructModel()
+        model.meshes[0].setName(self.model_name)
+        model.setModelMaterials(NoeModelMaterials([self.texture], [self.material]))
+
+        # UVs are flipped, we need to flip the Y component here.
+        for item in model.meshes[0].uvs:
+            item[1] = -item[1]
+        return model
+
+
+def read_buffer(bs):
+    """
+    First reads an int for length of buffer, then reads the length
+    :type bs: NoeBitStream
+    :rtype: bytes
+    """
+    buffer_size = bs.readInt()
+    return bs.readBytes(buffer_size)
